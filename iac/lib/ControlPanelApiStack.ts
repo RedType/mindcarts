@@ -1,47 +1,78 @@
 import { Construct } from 'constructs';
+import * as path from 'path';
 
 import * as cdk from 'aws-cdk-lib';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
+import * as dynamo from 'aws-cdk-lib/aws-dynamodb';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
+import * as events from 'aws-cdk-lib/aws-events';
 import * as gateway from 'aws-cdk-lib/aws-apigateway';
 import * as lambda from 'aws-cdk-lib/aws-lambda-nodejs';
+import * as targets from 'aws-cdk-lib/aws-events-targets';
+
+const DEFAULT_TIMEOUT = cdk.Duration.minutes(20);
 
 export interface ControlPanelApiStackProps extends cdk.StackProps {
-  instance: ec2.IInstance;
+  readonly timeoutDuration?: cdk.Duration;
 }
 
 export default class ControlPanelApiStack extends cdk.Stack {
+  readonly rconPeers: ec2.IConnectable[];
+
   constructor(scope: Construct, id: string, props?: ControlPanelApiStackProps) {
     super(scope, id, props);
+
+    //////////////////
+    // TimeoutEvent //
+    //////////////////
+
+    const timeout = new events.Rule(this, 'TimeoutRule', {
+      enabled: false, // to be enabled by GET /startServer
+      schedule: events.Schedule.rate(props?.timeoutDuration ?? DEFAULT_TIMEOUT),
+    });
+
+    //////////////////
+    // Config Table //
+    //////////////////
+
+    const configTable = new dynamo.Table(this, 'ConfigTable', {
+      partitionKey: { name: 'id', type: dynamo.AttributeType.STRING },
+    });
 
     //////////////////
     // API Handlers //
     //////////////////
 
+    const entry = path.join(__dirname, '../../lambdas/src/index.ts');
+    const depsLockFilePath = path.join(__dirname, '../../lambdas/package-lock.json');
+
     const startServer = new lambda.NodejsFunction(this, 'StartServerFn', {
-      entry: '../../lambdas/src/index.ts',
-      depsLockFilePath: '../../lambdas/package-lock.json',
+      entry, depsLockFilePath,
       handler: 'StartServer',
       description: 'Starts the Minecraft server',
     });
 
-    const timeoutServer = new lambda.NodejsFunction(this, 'TimeoutServerFn', {
-      entry: '../../lambdas/src/index.ts',
-      depsLockFilePath: '../../lambdas/package-lock.json',
-      handler: 'TimeoutServer',
+    const timeoutServers = new lambda.NodejsFunction(this, 'TimeoutServersFn', {
+      entry, depsLockFilePath,
+      handler: 'TimeoutServers',
       description: 'Checks to see if any players are logged in, and if not, shuts down server',
     });
 
+    timeout.addTarget(new targets.LambdaFunction(timeoutServers));
+
     const whitelistPlayer = new lambda.NodejsFunction(this, 'WhitelistPlayer', {
-      entry: '../../lambdas/src/index.ts',
-      depsLockFilePath: '../../lambdas/package-lock.json',
+      entry, depsLockFilePath,
       handler: 'WhitelistPlayer',
       description: 'Adds a player to the server\'s whitelist (and removes their old account)',
     });
 
-    ///////////////
-    // User Pool //
-    ///////////////
+    configTable.grantReadWriteData(whitelistPlayer.grantPrincipal);
+
+    this.rconPeers = [startServer, timeoutServers, whitelistPlayer];
+
+    /////////////////////
+    // User Identities //
+    /////////////////////
 
     const userPool = new cognito.UserPool(this, 'UserPool');
 
@@ -54,15 +85,19 @@ export default class ControlPanelApiStack extends cdk.Stack {
     const user = new gateway.CfnAuthorizer(this, 'UserAuthorizer', {
       name: 'UserAuthorizer',
       identitySource: 'method.request.header.Authorization',
-      providerArns: [],
+      providerArns: [userPool.userPoolArn],
       restApiId: api.restApiId,
       type: gateway.AuthorizationType.COGNITO,
     });
 
-    // GET /startServer
+    /////////////
+    // Methods //
+    /////////////
+
+    // POST /startServer
     api.root
       .addResource('startServer')
-      .addMethod('GET', new gateway.LambdaIntegration(startServer), {
+      .addMethod('POST', new gateway.LambdaIntegration(startServer), {
         authorizationType: gateway.AuthorizationType.COGNITO,
         authorizer: { authorizerId: user.ref },
       })

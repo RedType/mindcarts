@@ -2,71 +2,117 @@ import { Construct } from 'constructs';
 
 import * as cdk from 'aws-cdk-lib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
-import * as lambda from 'aws-cdk-lib/aws-lambda';
-import * as lambdaNode from 'aws-cdk-lib/aws-lambda-nodejs';
+import * as ecs from 'aws-cdk-lib/aws-ecs';
+import * as efs from 'aws-cdk-lib/aws-efs';
+import * as kms from 'aws-cdk-lib/aws-kms';
 
-export interface MinecraftStackProps extends cdk.StackProps { }
+const MINECRAFT_PORT = 25565;
+const NFS_PORT = 2049;
+const RCON_PORT = 25575;
+const SSH_PORT = 22;
+
+export interface MinecraftStackProps extends cdk.StackProps {
+  readonly cluster: ecs.ICluster;
+  readonly containerEnvironment?: Record<string, string>;
+  readonly containerImagePath: string;
+  readonly vpc: ec2.IVpc;
+}
 
 export default class MinecraftStack extends cdk.Stack {
-  public readonly server: ec2.Instance;
-  public readonly vpc: ec2.Vpc;
-  // lambdas for programmatic server interaction
-  public readonly startServer: lambda.Function;
-  public readonly timeoutServer: lambda.Function;
-  public readonly whitelistPlayer: lambda.Function;
+  private readonly service: ecs.FargateService;
 
-  constructor(scope: Construct, id: string, props?: MinecraftStackProps) {
+  constructor(scope: Construct, id: string, props: MinecraftStackProps) {
     super(scope, id, props);
 
-    const vpc = new ec2.Vpc(this, 'VPC');
+    const { cluster, vpc } = props;
 
-    const firewall = new ec2.SecurityGroup(this, 'MinecraftServerFirewall', {
-      vpc,
-      allowAllOutbound: false,
-    });
-    firewall.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(25565), 'Minecraft Server IPv4');
-    firewall.addIngressRule(ec2.Peer.anyIpv6(), ec2.Port.tcp(25565), 'Minecraft Server IPv6');
-    firewall.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(22), 'SSH IPv4');
-    firewall.addIngressRule(ec2.Peer.anyIpv6(), ec2.Port.tcp(22), 'SSH IPv6');
-    firewall.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.icmpPing(), 'Ping IPv4');
-    firewall.addIngressRule(ec2.Peer.anyIpv6(), ec2.Port.icmpPing(), 'Ping IPv6');
+    ///////////////////////
+    // Persistent Volume //
+    ///////////////////////
 
-    this.server = new ec2.Instance(this, 'MinecraftServer', {
-      // hardware
-      instanceType: ec2.InstanceType.of(ec2.InstanceClass.T2, ec2.InstanceSize.SMALL),
-      machineImage: ec2.MachineImage.genericLinux({
-        'us-east-1': 'ami-0b0ea68c435eb488d', // Ubuntu 16.04 LTS amd64
-      }),
+    const encryptionKey = new kms.Key(this, 'EncryptionKey');
 
-      // networking
+    const filesystem = new efs.FileSystem(this, 'ServerFilesystem', {
+      lifecyclePolicy: efs.LifecyclePolicy.AFTER_7_DAYS,
+      outOfInfrequentAccessPolicy: efs.OutOfInfrequentAccessPolicy.AFTER_1_ACCESS,
+
       vpc,
       vpcSubnets: {
-        subnetType: ec2.SubnetType.PUBLIC,
+        subnetType: ec2.SubnetType.PRIVATE_ISOLATED,
       },
-      securityGroup: firewall,
-      keyName: 'minecraft-server',
+
+      encrypted: true,
+      kmsKey: encryptionKey,
     });
 
-    this.startServer = new lambdaNode.NodejsFunction(this, 'StartServerFn', {
-      entry: '../../lambdas/src/index.ts',
-      depsLockFilePath: '../../lambdas/package-lock.json',
-      handler: 'StartServer',
-      description: 'Starts the Minecraft server',
+    const volume = {
+      name: 'minecraft-system-volume',
+      efsVolumeConfiguration: {
+        fileSystemId: filesystem.fileSystemId,
+        transitEncryption: 'ENABLED',
+      },
+    };
+
+    /////////////////
+    // Server Task //
+    /////////////////
+
+    const taskDefinition = new ecs.FargateTaskDefinition(this, 'TaskDefinition', {
+      cpu: 1024,
+      memoryLimitMiB: 6144, // 6 GiB
+      volumes: [volume],
     });
 
-    this.timeoutServer = new lambdaNode.NodejsFunction(this, 'TimeoutServerFn', {
-      entry: '../../lambdas/src/index.ts',
-      depsLockFilePath: '../../lambdas/package-lock.json',
-      handler: 'TimeoutServer',
-      description: 'Checks to see if any players are logged in, and if not, shuts down server',
+    const container = taskDefinition.addContainer('MinecraftServer', {
+      image: ecs.ContainerImage.fromAsset(props.containerImagePath),
+      portMappings: [
+        { hostPort: MINECRAFT_PORT, containerPort: MINECRAFT_PORT }, // minecraft server port
+        { hostPort: SSH_PORT, containerPort: SSH_PORT }, // ssh
+      ],
+      environment: props.containerEnvironment,
     });
 
-    this.whitelistPlayer = new lambdaNode.NodejsFunction(this, 'WhitelistPlayer', {
-      entry: '../../lambdas/src/index.ts',
-      depsLockFilePath: '../../lambdas/package-lock.json',
-      handler: 'WhitelistPlayer',
-      description: 'Adds a player to the server\'s whitelist (and removes their old account)',
+    container.addMountPoints({
+      containerPath: '/srv/minecraft',
+      sourceVolume: volume.name,
+      readOnly: false,
     });
+
+    const service = new ecs.FargateService(this, 'Service', {
+      cluster,
+      taskDefinition,
+      desiredCount: 0,
+    });
+
+    /////////////////////////
+    // Networking Internal //
+    /////////////////////////
+
+    // Internal NFS
+    filesystem.connections.allowFrom(service, ec2.Port.tcp(NFS_PORT));
+    service.connections.allowFrom(filesystem, ec2.Port.tcp(NFS_PORT));
+
+    /////////////////////////
+    // Networking External //
+    /////////////////////////
+
+    // Minecraft
+    service.connections.allowFrom(ec2.Peer.anyIpv4(), ec2.Port.tcp(MINECRAFT_PORT));
+    service.connections.allowFrom(ec2.Peer.anyIpv6(), ec2.Port.tcp(MINECRAFT_PORT));
+
+    // SSH
+    service.connections.allowFrom(ec2.Peer.anyIpv4(), ec2.Port.tcp(SSH_PORT));
+    service.connections.allowFrom(ec2.Peer.anyIpv6(), ec2.Port.tcp(SSH_PORT));
+
+    // Ping
+    service.connections.allowFrom(ec2.Peer.anyIpv4(), ec2.Port.icmpPing());
+    service.connections.allowFrom(ec2.Peer.anyIpv6(), ec2.Port.icmpPing());
+  }
+
+  public registerRconPeers(peers: ec2.IConnectable[]) {
+    for (const peer of peers) {
+      this.service.connections.allowFrom(peer, ec2.Port.tcp(RCON_PORT));
+    }
   }
 }
 

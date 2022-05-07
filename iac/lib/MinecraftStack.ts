@@ -1,10 +1,13 @@
 import { Construct } from 'constructs';
 
 import * as cdk from 'aws-cdk-lib';
+import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as efs from 'aws-cdk-lib/aws-efs';
+import * as elb from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import * as kms from 'aws-cdk-lib/aws-kms';
+import * as route53 from 'aws-cdk-lib/aws-route53';
 
 const MINECRAFT_PORT = 25565;
 const NFS_PORT = 2049;
@@ -15,10 +18,13 @@ export interface MinecraftStackProps extends cdk.StackProps {
   readonly cluster: ecs.ICluster;
   readonly containerEnvironment?: Record<string, string>;
   readonly containerImagePath: string;
+  readonly subdomain: string;
   readonly vpc: ec2.IVpc;
+  readonly zoneId: string;
 }
 
 export default class MinecraftStack extends cdk.Stack {
+  private readonly rconDnsName: string;
   private readonly service: ecs.FargateService;
 
   constructor(scope: Construct, id: string, props: MinecraftStackProps) {
@@ -78,7 +84,7 @@ export default class MinecraftStack extends cdk.Stack {
       readOnly: false,
     });
 
-    const service = new ecs.FargateService(this, 'Service', {
+    const service = this.service = new ecs.FargateService(this, 'Service', {
       cluster,
       taskDefinition,
       desiredCount: 0,
@@ -90,29 +96,58 @@ export default class MinecraftStack extends cdk.Stack {
 
     // Internal NFS
     filesystem.connections.allowFrom(service, ec2.Port.tcp(NFS_PORT));
+    filesystem.connections.allowTo(service, ec2.Port.tcp(NFS_PORT));
     service.connections.allowFrom(filesystem, ec2.Port.tcp(NFS_PORT));
+    service.connections.allowTo(filesystem, ec2.Port.tcp(NFS_PORT));
+
+    const ilb = new elb.NetworkLoadBalancer(this, 'InternalLB', { vpc, internetFacing: false });
+
+    ilb.addListener('rcon', { port: RCON_PORT })
+      .addTargets('rcon', {
+        targets: [service],
+        port: RCON_PORT,
+        healthCheck: { enabled: false },
+      })
+    ;
+
+    this.rconDnsName = ilb.loadBalancerDnsName;
 
     /////////////////////////
     // Networking External //
     /////////////////////////
 
-    // Minecraft
-    service.connections.allowFrom(ec2.Peer.anyIpv4(), ec2.Port.tcp(MINECRAFT_PORT));
-    service.connections.allowFrom(ec2.Peer.anyIpv6(), ec2.Port.tcp(MINECRAFT_PORT));
+    const lb = new elb.NetworkLoadBalancer(this, 'LB', { vpc, internetFacing: true });
 
-    // SSH
-    service.connections.allowFrom(ec2.Peer.anyIpv4(), ec2.Port.tcp(SSH_PORT));
-    service.connections.allowFrom(ec2.Peer.anyIpv6(), ec2.Port.tcp(SSH_PORT));
+    lb.addListener('minecraft', { port: MINECRAFT_PORT })
+      .addTargets('minecraft', {
+        targets: [service],
+        port: MINECRAFT_PORT,
+        protocol: elb.Protocol.TCP,
+        preserveClientIp: true, // for server ip bans and such
+        healthCheck: { enabled: false },
+      })
+    ;
 
-    // Ping
-    service.connections.allowFrom(ec2.Peer.anyIpv4(), ec2.Port.icmpPing());
-    service.connections.allowFrom(ec2.Peer.anyIpv6(), ec2.Port.icmpPing());
-  }
+    lb.addListener('ssh', { port: SSH_PORT })
+      .addTargets('ssh', {
+        targets: [service],
+        port: SSH_PORT,
+        protocol: elb.Protocol.TCP,
+        healthCheck: { enabled: false },
+      })
+    ;
 
-  public registerRconPeers(peers: ec2.IConnectable[]) {
-    for (const peer of peers) {
-      this.service.connections.allowFrom(peer, ec2.Port.tcp(RCON_PORT));
-    }
+    /////////
+    // DNS //
+    /////////
+
+    const zone = route53.HostedZone.fromHostedZoneId(this, 'Zone', props.zoneId);
+
+    new route53.CnameRecord(this, 'ServerRecord', {
+      zone,
+      recordName: props.subdomain,
+      domainName: lb.loadBalancerDnsName,
+    });
   }
 }
 

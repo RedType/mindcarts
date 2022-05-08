@@ -4,7 +4,7 @@ import * as path from 'path';
 import * as cdk from 'aws-cdk-lib';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as dynamo from 'aws-cdk-lib/aws-dynamodb';
-import * as ec2 from 'aws-cdk-lib/aws-ec2';
+import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as events from 'aws-cdk-lib/aws-events';
 import * as gateway from 'aws-cdk-lib/aws-apigateway';
 import * as lambda from 'aws-cdk-lib/aws-lambda-nodejs';
@@ -12,14 +12,19 @@ import * as targets from 'aws-cdk-lib/aws-events-targets';
 
 const DEFAULT_TIMEOUT = cdk.Duration.minutes(20);
 
-export interface ControlPanelApiStackProps extends cdk.StackProps {
+export interface ControlPlaneStackProps extends cdk.StackProps {
+  readonly cluster: ecs.ICluster;
+  readonly servers: {
+    readonly serverName: string;
+    readonly rconDnsName: string;
+  }[];
   readonly timeoutDuration?: cdk.Duration;
 }
 
-export default class ControlPanelApiStack extends cdk.Stack {
-  readonly rconPeers: ec2.IConnectable[];
+export default class ControlPlaneStack extends cdk.Stack {
+  readonly configTable: dynamo.ITable;
 
-  constructor(scope: Construct, id: string, props?: ControlPanelApiStackProps) {
+  constructor(scope: Construct, id: string, props: ControlPlaneStackProps) {
     super(scope, id, props);
 
     //////////////////
@@ -35,8 +40,10 @@ export default class ControlPanelApiStack extends cdk.Stack {
     // Config Table //
     //////////////////
 
-    const configTable = new dynamo.Table(this, 'ConfigTable', {
-      partitionKey: { name: 'id', type: dynamo.AttributeType.STRING },
+    this.configTable = new dynamo.Table(this, 'ConfigTable', {
+      partitionKey: { name: 'serverId', type: dynamo.AttributeType.STRING },
+      sortKey: { name: 'config', type: dynamo.AttributeType.STRING },
+      billingMode: dynamo.BillingMode.PAY_PER_REQUEST,
     });
 
     //////////////////
@@ -50,7 +57,13 @@ export default class ControlPanelApiStack extends cdk.Stack {
       entry, depsLockFilePath,
       handler: 'StartServer',
       description: 'Starts the Minecraft server',
+      environment: {
+        CLUSTER_ARN: props.cluster.clusterArn,
+        CONFIG_TABLE_NAME: this.configTable.tableName,
+      },
     });
+
+    this.configTable.grantWriteData(startServer.grantPrincipal);
 
     const timeoutServers = new lambda.NodejsFunction(this, 'TimeoutServersFn', {
       entry, depsLockFilePath,
@@ -59,6 +72,7 @@ export default class ControlPanelApiStack extends cdk.Stack {
     });
 
     timeout.addTarget(new targets.LambdaFunction(timeoutServers));
+    this.configTable.grantReadWriteData(timeoutServers);
 
     const whitelistPlayer = new lambda.NodejsFunction(this, 'WhitelistPlayer', {
       entry, depsLockFilePath,
@@ -66,9 +80,7 @@ export default class ControlPanelApiStack extends cdk.Stack {
       description: 'Adds a player to the server\'s whitelist (and removes their old account)',
     });
 
-    configTable.grantReadWriteData(whitelistPlayer.grantPrincipal);
-
-    this.rconPeers = [startServer, timeoutServers, whitelistPlayer];
+    this.configTable.grantReadWriteData(whitelistPlayer.grantPrincipal);
 
     /////////////////////
     // User Identities //
@@ -97,7 +109,7 @@ export default class ControlPanelApiStack extends cdk.Stack {
     // POST /startServer
     api.root
       .addResource('startServer')
-      .addMethod('POST', new gateway.LambdaIntegration(startServer), {
+      .addMethod('POST', new gateway.LambdaIntegration(startServer, { proxy: true }), {
         authorizationType: gateway.AuthorizationType.COGNITO,
         authorizer: { authorizerId: user.ref },
       })
@@ -106,7 +118,7 @@ export default class ControlPanelApiStack extends cdk.Stack {
     // POST /whitelistPlayer
     api.root
       .addResource('whitelistPlayer')
-      .addMethod('POST', new gateway.LambdaIntegration(whitelistPlayer), {
+      .addMethod('POST', new gateway.LambdaIntegration(whitelistPlayer, { proxy: true }), {
         authorizationType: gateway.AuthorizationType.COGNITO,
         authorizer: { authorizerId: user.ref },
       })

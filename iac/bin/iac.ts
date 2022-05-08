@@ -13,6 +13,8 @@ const { cluster, vpc } = new ClusterStack(app, 'ClusterStack');
 const vanilla = new MinecraftStack(app, 'VanillaMinecraftStack', {
   cluster, vpc,
   containerImagePath: path.join(__dirname, '../../servers/vanilla'),
+  subdomain: 'vanilla',
+  zoneId: 'Z0231152107QS84FSIVK6',
 });
 
 app.synth();

@@ -1,7 +1,9 @@
 import { Construct } from 'constructs';
+import { xor } from './util';
+import ConfigRecordProvider from './util/ConfigRecordProvider';
 
 import * as cdk from 'aws-cdk-lib';
-import * as acm from 'aws-cdk-lib/aws-certificatemanager';
+import * as dynamo from 'aws-cdk-lib/aws-dynamodb';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as efs from 'aws-cdk-lib/aws-efs';
@@ -16,21 +18,30 @@ const SSH_PORT = 22;
 
 export interface MinecraftStackProps extends cdk.StackProps {
   readonly cluster: ecs.ICluster;
+  readonly configRecordProvider: ConfigRecordProvider;
+  readonly configTable: dynamo.ITable;
   readonly containerEnvironment?: Record<string, string>;
   readonly containerImagePath: string;
-  readonly subdomain: string;
+  readonly serverId: string;
+  readonly subdomain?: string;
   readonly vpc: ec2.IVpc;
-  readonly zoneId: string;
+  readonly zoneId?: string;
 }
 
 export default class MinecraftStack extends cdk.Stack {
-  private readonly rconDnsName: string;
-  private readonly service: ecs.FargateService;
+  public readonly rconDnsName: string;
+  public readonly serverId: string;
+  public readonly service: ecs.FargateService;
 
   constructor(scope: Construct, id: string, props: MinecraftStackProps) {
     super(scope, id, props);
 
+    if(xor(props.subdomain, props.zoneId)) {
+      throw new Error('If one of subdomain and zoneId are defined, then both must be');
+    }
+
     const { cluster, vpc } = props;
+    this.serverId = props.serverId;
 
     ///////////////////////
     // Persistent Volume //
@@ -141,12 +152,22 @@ export default class MinecraftStack extends cdk.Stack {
     // DNS //
     /////////
 
-    const zone = route53.HostedZone.fromHostedZoneId(this, 'Zone', props.zoneId);
+    if (props.zoneId) {
+      const zone = route53.HostedZone.fromHostedZoneId(this, 'Zone', props.zoneId);
 
-    new route53.CnameRecord(this, 'ServerRecord', {
-      zone,
-      recordName: props.subdomain,
-      domainName: lb.loadBalancerDnsName,
+      new route53.CnameRecord(this, 'ServerRecord', {
+        zone,
+        recordName: props.subdomain,
+        domainName: lb.loadBalancerDnsName,
+      });
+    }
+
+    ///////////////////
+    // Config Record //
+    ///////////////////
+
+    props.configRecordProvider.getResource(this.node.path + '/ConfigRecord', {
+      serverId: props.serverId,
     });
   }
 }
